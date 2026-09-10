@@ -60,6 +60,41 @@ def exists(cmd):
     return shutil.which(cmd) is not None
 
 
+def get_pe_version(file_path):
+    if not file_path or os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        size = ctypes.windll.version.GetFileVersionInfoSizeW(file_path, None)
+        if size == 0:
+            return None
+        buf = ctypes.create_string_buffer(size)
+        if not ctypes.windll.version.GetFileVersionInfoW(file_path, 0, size, buf):
+            return None
+        lpffi = ctypes.c_void_p()
+        u_len = ctypes.c_uint()
+        if ctypes.windll.version.VerQueryValueW(buf, "\\", ctypes.byref(lpffi), ctypes.byref(u_len)):
+            class VS_FIXEDFILEINFO(ctypes.Structure):
+                _fields_ = [
+                    ("dwSignature", wintypes.DWORD),
+                    ("dwStrucVersion", wintypes.DWORD),
+                    ("dwFileVersionMS", wintypes.DWORD),
+                    ("dwFileVersionLS", wintypes.DWORD),
+                    ("dwProductVersionMS", wintypes.DWORD),
+                    ("dwProductVersionLS", wintypes.DWORD),
+                ]
+            ffi = VS_FIXEDFILEINFO.from_address(lpffi.value)
+            major = ffi.dwFileVersionMS >> 16
+            minor = ffi.dwFileVersionMS & 0xFFFF
+            patch = ffi.dwFileVersionLS >> 16
+            return f"{major}.{minor}.{patch}"
+    except Exception:
+        return None
+    return None
+
+
+
 def nvidia_info():
     if not exists("nvidia-smi"):
         return []
@@ -332,17 +367,32 @@ class Manager:
 
     def refresh_status(self):
         def work():
-            rows=[]
+            rows = []
             if exists("lms"):
-                r=hidden_run(["lms","--version"],8); v=(r.stdout or r.stderr).strip().splitlines()
-                rows.append(("LM Studio/llmster","설치됨",v[0] if v else "설치됨",LM_API))
-            else: rows.append(("LM Studio/llmster","미설치","-",LM_API))
+                lms_path = shutil.which("lms")
+                fv = get_pe_version(lms_path)
+                r = hidden_run(["lms", "-v"], 8)
+                cli_v = (r.stdout or "").strip() if r.returncode == 0 else ""
+                if fv and cli_v:
+                    v_str = f"{fv} ({cli_v})"
+                elif fv:
+                    v_str = f"v{fv}"
+                elif cli_v:
+                    v_str = cli_v
+                else:
+                    v_str = "설치됨"
+                rows.append(("LM Studio/llmster", "설치됨", v_str, LM_API))
+            else:
+                rows.append(("LM Studio/llmster", "미설치", "-", LM_API))
+
             if exists("ollama"):
-                r=hidden_run(["ollama","--version"],8)
-                rows.append(("Ollama","설치됨",(r.stdout or r.stderr).strip(),OLLAMA_API))
-            else: rows.append(("Ollama","미설치","-",OLLAMA_API))
-            self.emit("runtime",rows)
-        threading.Thread(target=work,daemon=True).start()
+                r = hidden_run(["ollama", "--version"], 8)
+                v_str = (r.stdout or "").strip() if r.returncode == 0 else "설치됨"
+                rows.append(("Ollama", "설치됨", v_str, OLLAMA_API))
+            else:
+                rows.append(("Ollama", "미설치", "-", OLLAMA_API))
+            self.emit("runtime", rows)
+        threading.Thread(target=work, daemon=True).start()
 
     def lm_start(self):
         def work():
@@ -564,13 +614,19 @@ class Manager:
                 full=[]
                 with requests.post(LM_API+"/v1/chat/completions",json=body,stream=True,timeout=(10,600)) as r:
                     r.raise_for_status()
-                    for line in r.iter_lines(decode_unicode=True):
-                        if not line or not line.startswith("data:"):continue
-                        p=line[5:].strip()
-                        if p=="[DONE]":break
+                    r.encoding = "utf-8"
+                    for raw_line in r.iter_lines(decode_unicode=False):
+                        if not raw_line:continue
+                        line = raw_line.decode("utf-8", errors="replace").strip()
+                        if not line.startswith("data:"):continue
+                        p = line[5:].strip()
+                        if p == "[DONE]":break
                         try:
-                            tok=json.loads(p)["choices"][0].get("delta",{}).get("content","")
-                            if tok:full.append(tok);self.emit("token",tok)
+                            delta = json.loads(p)["choices"][0].get("delta", {})
+                            tok = delta.get("content") or delta.get("reasoning_content") or ""
+                            if tok:
+                                full.append(tok)
+                                self.emit("token", tok)
                         except Exception:pass
             else:
                 body={"model":model,"messages":self.hist[backend],"stream":True,
@@ -578,10 +634,15 @@ class Manager:
                 full=[]
                 with requests.post(OLLAMA_API+"/api/chat",json=body,stream=True,timeout=(10,600)) as r:
                     r.raise_for_status()
-                    for line in r.iter_lines(decode_unicode=True):
-                        if not line:continue
-                        o=json.loads(line);tok=(o.get("message") or {}).get("content","")
-                        if tok:full.append(tok);self.emit("token",tok)
+                    r.encoding = "utf-8"
+                    for raw_line in r.iter_lines(decode_unicode=False):
+                        if not raw_line:continue
+                        line = raw_line.decode("utf-8", errors="replace")
+                        o = json.loads(line)
+                        tok = (o.get("message") or {}).get("content", "")
+                        if tok:
+                            full.append(tok)
+                            self.emit("token", tok)
                         if o.get("done"):break
             text="".join(full)
             if text:self.hist[backend].append({"role":"assistant","content":text})
