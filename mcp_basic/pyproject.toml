@@ -1,0 +1,10 @@
+[project]
+name = "mcp-ollama-basic"
+version = "0.1.0"
+description = "A very small MCP example for Ollama and Open WebUI lectures"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp[cli]>=1.27,<2",
+    "ollama>=0.5",
+    "openai>=1.0",
+]
